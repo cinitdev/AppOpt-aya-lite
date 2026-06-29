@@ -38,14 +38,14 @@ git clone --depth=1 --branch "$UPSTREAM_REF" "$UPSTREAM_URL" "$UPSTREAM_DIR"
 
 UPSTREAM_COMMIT="$(git -C "$UPSTREAM_DIR" rev-parse HEAD)"
 UPSTREAM_COMMIT_SHORT="$(git -C "$UPSTREAM_DIR" rev-parse --short HEAD)"
-SYNC_TIME="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+UPSTREAM_COMMIT_DATE="$(git -C "$UPSTREAM_DIR" show -s --format=%cI HEAD)"
 
 echo "- 上游 commit: $UPSTREAM_COMMIT_SHORT"
 echo "- 裁剪 workspace: aya + aya-obj"
 
 rm -rf "$REPO_ROOT/aya" "$REPO_ROOT/aya-obj"
-cp -a "$UPSTREAM_DIR/aya" "$REPO_ROOT/aya"
-cp -a "$UPSTREAM_DIR/aya-obj" "$REPO_ROOT/aya-obj"
+cp -aL "$UPSTREAM_DIR/aya" "$REPO_ROOT/aya"
+cp -aL "$UPSTREAM_DIR/aya-obj" "$REPO_ROOT/aya-obj"
 
 cp -f "$UPSTREAM_DIR/LICENSE-APACHE" "$REPO_ROOT/LICENSE-APACHE"
 cp -f "$UPSTREAM_DIR/LICENSE-MIT" "$REPO_ROOT/LICENSE-MIT"
@@ -58,10 +58,9 @@ cat > "$REPO_ROOT/UPSTREAM.md" <<EOF
 - 上游仓库：$UPSTREAM_URL
 - 上游分支：$UPSTREAM_REF
 - 上游 commit：$UPSTREAM_COMMIT
-- 同步时间：$SYNC_TIME
+- 上游 commit 时间：$UPSTREAM_COMMIT_DATE
 
 本仓库只保留上游 Aya 的 \`aya\` 和 \`aya-obj\` crate。
 EOF
 
 echo "- 同步完成"
-
