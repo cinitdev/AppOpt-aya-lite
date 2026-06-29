@@ -49,8 +49,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          if [ -z "$(git status --porcelain)" ]; then
-            echo "上游没有新变化"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "上游没有可提交变化"
             exit 0
           fi
 
@@ -61,7 +62,6 @@ jobs:
           BASE_BRANCH="${GITHUB_REF_NAME:-main}"
 
           git checkout -b "$BRANCH"
-          git add .
           git commit -m "sync: update aya upstream"
           git push origin "$BRANCH"
 
