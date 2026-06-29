@@ -497,7 +497,7 @@ impl NetlinkSocket {
                 SOL_NETLINK,
                 NETLINK_EXT_ACK,
                 ptr::from_ref(&enable).cast(),
-                size_of_val(&enable) as u32,
+                size_of_val(&enable) as libc::socklen_t,
             ) < 0
             {
                 return Err(NetlinkErrorInternal::IoError(io::Error::last_os_error()));
@@ -509,7 +509,7 @@ impl NetlinkSocket {
                 SOL_NETLINK,
                 NETLINK_CAP_ACK,
                 ptr::from_ref(&enable).cast(),
-                size_of_val(&enable) as u32,
+                size_of_val(&enable) as libc::socklen_t,
             ) < 0
             {
                 return Err(NetlinkErrorInternal::IoError(io::Error::last_os_error()));

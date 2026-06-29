@@ -51,6 +51,7 @@ cp -f "$UPSTREAM_DIR/LICENSE-APACHE" "$REPO_ROOT/LICENSE-APACHE"
 cp -f "$UPSTREAM_DIR/LICENSE-MIT" "$REPO_ROOT/LICENSE-MIT"
 
 "$PYTHON_BIN" "$SCRIPT_DIR/trim_workspace.py" "$UPSTREAM_DIR/Cargo.toml" "$REPO_ROOT/Cargo.toml"
+"$PYTHON_BIN" "$SCRIPT_DIR/apply-appopt-patches.py"
 
 cat > "$REPO_ROOT/UPSTREAM.md" <<EOF
 # 上游同步状态

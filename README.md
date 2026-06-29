@@ -68,7 +68,8 @@ bash scripts/sync-upstream.sh
 1. 克隆上游 Aya。
 2. 只复制 `aya`、`aya-obj` 和许可证文件。
 3. 将上游根 `Cargo.toml` 裁剪为只包含 `aya` / `aya-obj` 的 workspace。
-4. 写入 `UPSTREAM.md`，记录本次同步的上游地址、分支和 commit。
+4. 执行 `scripts/apply-appopt-patches.py`，套用 AppOpt 的 Android 兼容补丁。
+5. 写入 `UPSTREAM.md`，记录本次同步的上游地址、分支和 commit。
 
 同步后需要执行：
 

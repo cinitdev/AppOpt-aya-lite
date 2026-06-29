@@ -27,6 +27,13 @@ jobs:
       - name: Check workspace
         run: cargo check --workspace --all-targets
 
+      - name: Check Android targets
+        run: |
+          rustup target add aarch64-linux-android armv7-linux-androideabi x86_64-linux-android i686-linux-android
+          cargo check --workspace --target aarch64-linux-android
+          cargo check --workspace --target armv7-linux-androideabi
+          cargo check --workspace --target x86_64-linux-android
+          cargo check --workspace --target i686-linux-android
+
       - name: Test workspace
         run: cargo test --workspace --lib
-

@@ -24,6 +24,8 @@ mod linux_bindings_riscv64;
 mod linux_bindings_s390x;
 #[cfg(target_arch = "x86_64")]
 mod linux_bindings_x86_64;
+#[cfg(target_arch = "x86")]
+mod linux_bindings_x86_64;
 
 #[cfg(target_arch = "aarch64")]
 pub use linux_bindings_aarch64::*;
@@ -42,4 +44,6 @@ pub use linux_bindings_riscv64::*;
 #[cfg(target_arch = "s390x")]
 pub use linux_bindings_s390x::*;
 #[cfg(target_arch = "x86_64")]
+pub use linux_bindings_x86_64::*;
+#[cfg(target_arch = "x86")]
 pub use linux_bindings_x86_64::*;
