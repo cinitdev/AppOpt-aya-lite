@@ -1,0 +1,68 @@
+name: Sync Upstream Aya
+
+on:
+  schedule:
+    - cron: "0 20 * * 0"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync:
+    name: Sync, build and open PR
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Prepare Rust
+        run: |
+          rustup update stable
+          rustup default stable
+          rustc --version
+          cargo --version
+
+      - name: Sync upstream
+        run: bash scripts/sync-upstream.sh
+
+      - name: Check format
+        run: cargo fmt --all -- --check
+
+      - name: Check workspace
+        run: cargo check --workspace --all-targets
+
+      - name: Test workspace
+        run: cargo test --workspace --lib
+
+      - name: Create pull request
+        if: ${{ success() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ -z "$(git status --porcelain)" ]; then
+            echo "上游没有新变化"
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          BRANCH="sync/aya-upstream-$(date -u +%Y%m%d-%H%M%S)"
+          BASE_BRANCH="${GITHUB_REF_NAME:-main}"
+
+          git checkout -b "$BRANCH"
+          git add .
+          git commit -m "sync: update aya upstream"
+          git push origin "$BRANCH"
+
+          gh pr create \
+            --base "$BASE_BRANCH" \
+            --head "$BRANCH" \
+            --title "sync: update aya upstream" \
+            --body-file UPSTREAM.md
+
