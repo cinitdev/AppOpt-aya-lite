@@ -48,6 +48,25 @@ def main() -> int:
         '#[cfg(target_arch = "x86")]\n'
         "pub const BPF_F_CTXLEN_MASK: _bindgen_ty_14 = 4503595332403200u64 as _bindgen_ty_14;",
     )
+
+    android_reuseport_constants = (
+        '#[cfg(target_os = "android")]\n'
+        "const SO_ATTACH_REUSEPORT_EBPF: libc::c_int = 52;\n"
+        '#[cfg(target_os = "android")]\n'
+        "const SO_DETACH_REUSEPORT_BPF: libc::c_int = 68;"
+    )
+    for relative_path in [
+        "aya/src/programs/sk_reuseport.rs",
+        "aya/src/programs/socket_filter.rs",
+    ]:
+        replace_checked(
+            ROOT / relative_path,
+            "use libc::{SO_ATTACH_REUSEPORT_EBPF, SO_DETACH_REUSEPORT_BPF, SOL_SOCKET, setsockopt};",
+            '#[cfg(not(target_os = "android"))]\n'
+            "use libc::{SO_ATTACH_REUSEPORT_EBPF, SO_DETACH_REUSEPORT_BPF};\n"
+            "use libc::{SOL_SOCKET, setsockopt};\n\n"
+            f"{android_reuseport_constants}",
+        )
     return 0
 
 
