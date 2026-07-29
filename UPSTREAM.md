@@ -2,7 +2,7 @@
 
 - 上游仓库：https://github.com/aya-rs/aya.git
 - 上游分支：main
-- 上游 commit：231e54f29f5de163924671029e72da4672eba274
-- 上游 commit 时间：2026-06-25T12:36:47-04:00
+- 上游 commit：05d5269f848e3565e964690fc7111817a2258033
+- 上游 commit 时间：2026-07-29T07:51:24Z
 
 本仓库只保留上游 Aya 的 `aya` 和 `aya-obj` crate。
