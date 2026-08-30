@@ -2,6 +2,7 @@
 
 use std::{
     borrow::ToOwned as _,
+    cell::LazyCell,
     collections::BTreeMap,
     ffi::{CStr, CString, FromBytesWithNulError},
     mem, ptr,
@@ -12,16 +13,13 @@ use std::{
 
 use log::debug;
 use object::{
-    Endianness, ObjectSymbol as _, ObjectSymbolTable as _, RelocationTarget, SectionIndex,
-    SectionKind, SymbolKind,
+    Endian as _, Endianness, ObjectSymbol as _, ObjectSymbolTable as _, RelocationTarget,
+    SectionIndex, SectionKind, SymbolKind,
     read::{Object as _, ObjectSection as _, Section as ObjSection},
 };
 
 use crate::{
-    btf::{
-        Array, Btf, BtfError, BtfExt, BtfFeatures, BtfType, DataSecEntry, FuncSecInfo, LineSecInfo,
-        Struct,
-    },
+    btf::{Array, Btf, BtfError, BtfExt, BtfType, DataSecEntry, FuncSecInfo, LineSecInfo, Struct},
     generated::{
         BPF_CALL, BPF_F_RDONLY_PROG, BPF_JMP, BPF_K, bpf_func_id, bpf_insn, bpf_map_info,
         bpf_map_type::BPF_MAP_TYPE_ARRAY,
@@ -36,92 +34,6 @@ use crate::{
 };
 
 const KERNEL_VERSION_ANY: u32 = 0xFFFF_FFFE;
-
-/// Features implements BPF and BTF feature detection
-#[derive(Default, Debug)]
-pub struct Features {
-    bpf_name: bool,
-    bpf_probe_read_kernel: bool,
-    bpf_perf_link: bool,
-    bpf_global_data: bool,
-    bpf_cookie: bool,
-    cpumap_prog_id: bool,
-    devmap_prog_id: bool,
-    btf: Option<BtfFeatures>,
-}
-
-impl Features {
-    #[doc(hidden)]
-    #[expect(
-        clippy::fn_params_excessive_bools,
-        reason = "this interface is terrible"
-    )]
-    #[expect(clippy::too_many_arguments, reason = "this interface is terrible")]
-    pub const fn new(
-        bpf_name: bool,
-        bpf_probe_read_kernel: bool,
-        bpf_perf_link: bool,
-        bpf_global_data: bool,
-        bpf_cookie: bool,
-        cpumap_prog_id: bool,
-        devmap_prog_id: bool,
-        btf: Option<BtfFeatures>,
-    ) -> Self {
-        Self {
-            bpf_name,
-            bpf_probe_read_kernel,
-            bpf_perf_link,
-            bpf_global_data,
-            bpf_cookie,
-            cpumap_prog_id,
-            devmap_prog_id,
-            btf,
-        }
-    }
-
-    /// Returns whether BPF program names and map names are supported.
-    ///
-    /// Although the feature probe performs the check for program name, we can use this to also
-    /// detect if map name is supported since they were both introduced in the same commit.
-    pub const fn bpf_name(&self) -> bool {
-        self.bpf_name
-    }
-
-    /// Returns whether the `bpf_probe_read_kernel` helper is supported.
-    pub const fn bpf_probe_read_kernel(&self) -> bool {
-        self.bpf_probe_read_kernel
-    }
-
-    /// Returns whether `bpf_links` are supported for Kprobes/Uprobes/Tracepoints.
-    pub const fn bpf_perf_link(&self) -> bool {
-        self.bpf_perf_link
-    }
-
-    /// Returns whether BPF program global data is supported.
-    pub const fn bpf_global_data(&self) -> bool {
-        self.bpf_global_data
-    }
-
-    /// Returns whether BPF program cookie is supported.
-    pub const fn bpf_cookie(&self) -> bool {
-        self.bpf_cookie
-    }
-
-    /// Returns whether XDP CPU Maps support chained program IDs.
-    pub const fn cpumap_prog_id(&self) -> bool {
-        self.cpumap_prog_id
-    }
-
-    /// Returns whether XDP Device Maps support chained program IDs.
-    pub const fn devmap_prog_id(&self) -> bool {
-        self.devmap_prog_id
-    }
-
-    /// If BTF is supported, returns which BTF features are supported.
-    pub const fn btf(&self) -> Option<&BtfFeatures> {
-        self.btf.as_ref()
-    }
-}
 
 /// The loaded object file representation
 #[derive(Clone, Debug)]
@@ -232,9 +144,11 @@ pub enum ProgramSection {
     KProbe,
     UProbe {
         sleepable: bool,
+        multi: bool,
     },
     URetProbe {
         sleepable: bool,
+        multi: bool,
     },
     TracePoint,
     SocketFilter,
@@ -306,10 +220,38 @@ impl FromStr for ProgramSection {
         Ok(match kind {
             "kprobe" => Self::KProbe,
             "kretprobe" => Self::KRetProbe,
-            "uprobe" => Self::UProbe { sleepable: false },
-            "uprobe.s" => Self::UProbe { sleepable: true },
-            "uretprobe" => Self::URetProbe { sleepable: false },
-            "uretprobe.s" => Self::URetProbe { sleepable: true },
+            "uprobe" => Self::UProbe {
+                sleepable: false,
+                multi: false,
+            },
+            "uprobe.s" => Self::UProbe {
+                sleepable: true,
+                multi: false,
+            },
+            "uprobe.multi" => Self::UProbe {
+                sleepable: false,
+                multi: true,
+            },
+            "uprobe.multi.s" => Self::UProbe {
+                sleepable: true,
+                multi: true,
+            },
+            "uretprobe" => Self::URetProbe {
+                sleepable: false,
+                multi: false,
+            },
+            "uretprobe.s" => Self::URetProbe {
+                sleepable: true,
+                multi: false,
+            },
+            "uretprobe.multi" => Self::URetProbe {
+                sleepable: false,
+                multi: true,
+            },
+            "uretprobe.multi.s" => Self::URetProbe {
+                sleepable: true,
+                multi: true,
+            },
             "xdp" | "xdp.frags" => Self::Xdp {
                 frags: kind == "xdp.frags",
                 attach_type: match pieces.next() {
@@ -498,6 +440,7 @@ impl Object {
                     size: symbol.size(),
                     is_definition: symbol.is_definition(),
                     kind: symbol.kind(),
+                    is_weak: symbol.is_weak(),
                 };
                 bpf_obj.symbol_table.insert(symbol.index().0, sym);
                 if let Some(section_idx) = symbol.section().index() {
@@ -521,6 +464,8 @@ impl Object {
             if let Some(s) = obj.section_by_name(".BTF.ext") {
                 bpf_obj.parse_section(Section::try_from(&s)?)?;
             }
+
+            bpf_obj.collect_ksyms_from_btf()?;
         }
 
         for s in obj.sections() {
@@ -910,10 +855,16 @@ impl Object {
         Ok(())
     }
 
-    /// Sanitize BPF functions.
-    pub fn sanitize_functions(&mut self, features: &Features) {
+    /// Sanitizes BPF functions.
+    pub fn sanitize_functions(&mut self, probe_read_kernel_supported: impl FnOnce() -> bool) {
+        // Checking whether the kernel supports the address-space-specific probe-read
+        // helpers can require loading a small BPF program. Defer the check until the
+        // sanitization encounters a call to one of those helpers, then reuse the result.
+        let support = LazyCell::new(probe_read_kernel_supported);
+        let probe_read_kernel_supported = || *support;
+
         for function in self.functions.values_mut() {
-            function.sanitize(features);
+            function.sanitize(&probe_read_kernel_supported);
         }
     }
 }
@@ -927,32 +878,29 @@ fn insn_is_helper_call(ins: bpf_insn) -> bool {
 }
 
 impl Function {
-    fn sanitize(&mut self, features: &Features) {
+    fn sanitize(&mut self, probe_read_kernel_supported: &impl Fn() -> bool) {
+        const BPF_FUNC_PROBE_READ_KERNEL: i32 = bpf_func_id::BPF_FUNC_probe_read_kernel as i32;
+        const BPF_FUNC_PROBE_READ_USER: i32 = bpf_func_id::BPF_FUNC_probe_read_user as i32;
+        const BPF_FUNC_PROBE_READ: i32 = bpf_func_id::BPF_FUNC_probe_read as i32;
+        const BPF_FUNC_PROBE_READ_KERNEL_STR: i32 =
+            bpf_func_id::BPF_FUNC_probe_read_kernel_str as i32;
+        const BPF_FUNC_PROBE_READ_USER_STR: i32 = bpf_func_id::BPF_FUNC_probe_read_user_str as i32;
+        const BPF_FUNC_PROBE_READ_STR: i32 = bpf_func_id::BPF_FUNC_probe_read_str as i32;
+
         for inst in &mut self.instructions {
             if !insn_is_helper_call(*inst) {
                 continue;
             }
 
-            if !features.bpf_probe_read_kernel {
-                const BPF_FUNC_PROBE_READ_KERNEL: i32 =
-                    bpf_func_id::BPF_FUNC_probe_read_kernel as i32;
-                const BPF_FUNC_PROBE_READ_USER: i32 = bpf_func_id::BPF_FUNC_probe_read_user as i32;
-                const BPF_FUNC_PROBE_READ: i32 = bpf_func_id::BPF_FUNC_probe_read as i32;
-                const BPF_FUNC_PROBE_READ_KERNEL_STR: i32 =
-                    bpf_func_id::BPF_FUNC_probe_read_kernel_str as i32;
-                const BPF_FUNC_PROBE_READ_USER_STR: i32 =
-                    bpf_func_id::BPF_FUNC_probe_read_user_str as i32;
-                const BPF_FUNC_PROBE_READ_STR: i32 = bpf_func_id::BPF_FUNC_probe_read_str as i32;
-
-                match inst.imm {
-                    BPF_FUNC_PROBE_READ_KERNEL | BPF_FUNC_PROBE_READ_USER => {
-                        inst.imm = BPF_FUNC_PROBE_READ;
-                    }
-                    BPF_FUNC_PROBE_READ_KERNEL_STR | BPF_FUNC_PROBE_READ_USER_STR => {
-                        inst.imm = BPF_FUNC_PROBE_READ_STR;
-                    }
-                    _ => {}
+            let fallback = match inst.imm {
+                BPF_FUNC_PROBE_READ_KERNEL | BPF_FUNC_PROBE_READ_USER => BPF_FUNC_PROBE_READ,
+                BPF_FUNC_PROBE_READ_KERNEL_STR | BPF_FUNC_PROBE_READ_USER_STR => {
+                    BPF_FUNC_PROBE_READ_STR
                 }
+                _ => continue,
+            };
+            if !probe_read_kernel_supported() {
+                inst.imm = fallback;
             }
         }
     }
@@ -1166,24 +1114,15 @@ fn parse_license(data: &[u8]) -> Result<CString, ParseError> {
 }
 
 fn parse_version(data: &[u8], endianness: Endianness) -> Result<Option<u32>, ParseError> {
-    let data = match data.len() {
-        4 => data.try_into().unwrap(),
-        _ => {
-            return Err(ParseError::InvalidKernelVersion {
+    let data = data
+        .try_into()
+        .map_err(
+            |std::array::TryFromSliceError { .. }| ParseError::InvalidKernelVersion {
                 data: data.to_vec(),
-            });
-        }
-    };
+            },
+        )?;
 
-    #[expect(
-        clippy::big_endian_bytes,
-        clippy::little_endian_bytes,
-        reason = "that's the point"
-    )]
-    let v = match endianness {
-        Endianness::Big => u32::from_be_bytes(data),
-        Endianness::Little => u32::from_le_bytes(data),
-    };
+    let v = endianness.read_u32(data);
 
     Ok(if v == KERNEL_VERSION_ANY {
         None
@@ -1531,9 +1470,13 @@ fn get_func_and_line_info(
 #[cfg(test)]
 mod tests {
     use assert_matches::assert_matches;
+    use rstest::rstest;
 
     use super::*;
-    use crate::generated::{bpf_map_type::BPF_MAP_TYPE_BLOOM_FILTER, btf_ext_header};
+    use crate::{
+        btf::BtfFeature,
+        generated::{bpf_map_type::BPF_MAP_TYPE_BLOOM_FILTER, btf_ext_header},
+    };
 
     const FAKE_INS_LEN: u64 = 8;
 
@@ -1577,6 +1520,7 @@ mod tests {
                 size,
                 is_definition: false,
                 kind: SymbolKind::Text,
+                is_weak: false,
             },
         );
         obj.symbols_by_section
@@ -1789,7 +1733,9 @@ mod tests {
         ))
         .unwrap();
 
-        let btf = obj.fixup_and_sanitize_btf(&BtfFeatures::default()).unwrap();
+        let btf = obj
+            .fixup_and_sanitize_btf(|| Some(|_: BtfFeature| false))
+            .unwrap();
         assert!(btf.is_none());
     }
 
@@ -2046,101 +1992,71 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_parse_section_uprobe() {
+    #[rstest]
+    #[case::uprobe_plain(
+        "uprobe/foo",
+        ProgramSection::UProbe { sleepable: false, multi: false }
+    )]
+    #[case::uprobe_sleepable(
+        "uprobe.s/foo",
+        ProgramSection::UProbe { sleepable: true, multi: false }
+    )]
+    #[case::uprobe_multi(
+        "uprobe.multi/foo",
+        ProgramSection::UProbe { sleepable: false, multi: true }
+    )]
+    #[case::uprobe_multi_sleepable(
+        "uprobe.multi.s/foo",
+        ProgramSection::UProbe { sleepable: true, multi: true }
+    )]
+    #[case::uretprobe_plain(
+        "uretprobe/foo",
+        ProgramSection::URetProbe { sleepable: false, multi: false }
+    )]
+    #[case::uretprobe_sleepable(
+        "uretprobe.s/foo",
+        ProgramSection::URetProbe { sleepable: true, multi: false }
+    )]
+    #[case::uretprobe_multi(
+        "uretprobe.multi/foo",
+        ProgramSection::URetProbe { sleepable: false, multi: true }
+    )]
+    #[case::uretprobe_multi_sleepable(
+        "uretprobe.multi.s/foo",
+        ProgramSection::URetProbe { sleepable: true, multi: true }
+    )]
+    fn test_parse_section_user_probe(
+        #[case] section: &str,
+        #[case] expected_section: ProgramSection,
+    ) {
         let mut obj = fake_obj();
         fake_sym(&mut obj, 0, 0, "foo", FAKE_INS_LEN);
 
         assert_matches!(
             obj.parse_section(fake_section(
                 EbpfSectionKind::Program,
-                "uprobe/foo",
+                section,
                 bytes_of(&fake_ins()),
                 None
             )),
             Ok(())
         );
-        assert_matches!(
-            obj.programs.get("foo"),
-            Some(Program {
-                section: ProgramSection::UProbe { .. },
-                ..
-            })
-        );
-    }
-
-    #[test]
-    fn test_parse_section_uprobe_sleepable() {
-        let mut obj = fake_obj();
-        fake_sym(&mut obj, 0, 0, "foo", FAKE_INS_LEN);
-
-        assert_matches!(
-            obj.parse_section(fake_section(
-                EbpfSectionKind::Program,
-                "uprobe.s/foo",
-                bytes_of(&fake_ins()),
-                None
-            )),
-            Ok(())
-        );
-        assert_matches!(
-            obj.programs.get("foo"),
-            Some(Program {
-                section: ProgramSection::UProbe {
-                    sleepable: true,
-                    ..
+        let program = obj.programs.remove("foo").unwrap();
+        assert_matches!((program.section, expected_section),
+            (
+                ProgramSection::UProbe {
+                    sleepable: actual_sleepable,
+                    multi: actual_multi,
                 },
-                ..
-            })
-        );
-    }
-
-    #[test]
-    fn test_parse_section_uretprobe() {
-        let mut obj = fake_obj();
-        fake_sym(&mut obj, 0, 0, "foo", FAKE_INS_LEN);
-
-        assert_matches!(
-            obj.parse_section(fake_section(
-                EbpfSectionKind::Program,
-                "uretprobe/foo",
-                bytes_of(&fake_ins()),
-                None
-            )),
-            Ok(())
-        );
-        assert_matches!(
-            obj.programs.get("foo"),
-            Some(Program {
-                section: ProgramSection::URetProbe { .. },
-                ..
-            })
-        );
-    }
-
-    #[test]
-    fn test_parse_section_uretprobe_sleepable() {
-        let mut obj = fake_obj();
-        fake_sym(&mut obj, 0, 0, "foo", FAKE_INS_LEN);
-
-        assert_matches!(
-            obj.parse_section(fake_section(
-                EbpfSectionKind::Program,
-                "uretprobe.s/foo",
-                bytes_of(&fake_ins()),
-                None
-            )),
-            Ok(())
-        );
-        assert_matches!(
-            obj.programs.get("foo"),
-            Some(Program {
-                section: ProgramSection::URetProbe {
-                    sleepable: true,
-                    ..
+                ProgramSection::UProbe { sleepable, multi },
+            )
+            | (
+                ProgramSection::URetProbe {
+                    sleepable: actual_sleepable,
+                    multi: actual_multi,
                 },
-                ..
-            })
+                ProgramSection::URetProbe { sleepable, multi },
+            ) => assert_eq!((actual_sleepable, actual_multi), (sleepable, multi))
         );
     }
 
@@ -2820,6 +2736,7 @@ mod tests {
                 size: 3,
                 is_definition: true,
                 kind: SymbolKind::Data,
+                is_weak: false,
             },
         );
 
