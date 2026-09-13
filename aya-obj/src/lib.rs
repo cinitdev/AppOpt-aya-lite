@@ -62,9 +62,9 @@
 )]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![deny(missing_docs)]
-#![cfg_attr(test, expect(unused_crate_dependencies, reason = "used in doctests"))]
 
 pub mod btf;
+mod extern_types;
 #[expect(
     clippy::all,
     clippy::as_pointer_underscore,
@@ -96,6 +96,7 @@ pub mod programs;
 pub mod relocation;
 mod util;
 
+pub use extern_types::KsymsError;
 pub use maps::Map;
 pub use obj::*;
 
