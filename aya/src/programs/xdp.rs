@@ -1,6 +1,7 @@
 //! eXpress Data Path (XDP) programs.
 
 use std::{
+    convert::Infallible,
     ffi::CString,
     hash::Hash,
     os::fd::{AsFd as _, AsRawFd as _, BorrowedFd, RawFd},
@@ -159,7 +160,7 @@ impl Xdp {
                 // Fall back to netlink-based attachment.
 
                 let if_index = if_index as i32;
-                unsafe { netlink_set_xdp_fd(if_index, Some(prog_fd), None, mode) }
+                netlink_set_xdp_fd(if_index, Some(prog_fd), None, mode)
                     .map_err(XdpError::NetlinkError)?;
 
                 let prog_fd = prog_fd.as_raw_fd();
@@ -214,18 +215,16 @@ impl Xdp {
             }) => {
                 // SAFETY: TODO(https://github.com/aya-rs/aya/issues/612): make this safe by not holding `RawFd`s.
                 let old_prog_fd = unsafe { BorrowedFd::borrow_raw(old_prog_fd) };
-                unsafe {
-                    // Preserve the atomic replacement contract for netlink
-                    // links: only replace the current XDP program if it still
-                    // matches the program fd recorded in this link. The
-                    // netlink API expresses that compare-and-replace operation
-                    // with XDP_FLAGS_REPLACE and IFLA_XDP_EXPECTED_FD, which
-                    // were added in Linux 5.7. On older kernels this request
-                    // is expected to fail in the kernel instead of degrading to
-                    // an unconditional replacement.
-                    netlink_set_xdp_fd(if_index, Some(prog_fd), Some(old_prog_fd), mode)
-                        .map_err(XdpError::NetlinkError)?;
-                }
+                // Preserve the atomic replacement contract for netlink
+                // links: only replace the current XDP program if it still
+                // matches the program fd recorded in this link. The
+                // netlink API expresses that compare-and-replace operation
+                // with XDP_FLAGS_REPLACE and IFLA_XDP_EXPECTED_FD, which
+                // were added in Linux 5.7. On older kernels this request
+                // is expected to fail in the kernel instead of degrading to
+                // an unconditional replacement.
+                netlink_set_xdp_fd(if_index, Some(prog_fd), Some(old_prog_fd), mode)
+                    .map_err(XdpError::NetlinkError)?;
 
                 let prog_fd = prog_fd.as_raw_fd();
                 self.data
@@ -252,6 +251,7 @@ pub(crate) struct NlLinkId(i32, RawFd);
 
 impl Link for NlLink {
     type Id = NlLinkId;
+    type Error = Infallible;
 
     fn id(&self) -> Self::Id {
         let Self {
@@ -262,14 +262,14 @@ impl Link for NlLink {
         NlLinkId(*if_index, *prog_fd)
     }
 
-    fn detach(self) -> Result<(), ProgramError> {
+    fn detach(self) -> Result<(), Self::Error> {
         let Self {
             if_index,
             prog_fd,
             mode,
         } = self;
         // IFLA_XDP_EXPECTED_FD and XDP_FLAGS_REPLACE were added in Linux 5.7;
-        // see https://github.com/torvalds/linux/commit/92234c8f. Use them
+        // see https://github.com/torvalds/linux/commit/92234c8f1. Use them
         // when available so detach only clears the program represented by this
         // link. On older kernels, skip the expected fd so detach keeps the
         // legacy best-effort behavior instead of failing because the kernel
@@ -278,8 +278,7 @@ impl Link for NlLink {
             // SAFETY: TODO(https://github.com/aya-rs/aya/issues/612): make this safe by not holding `RawFd`s.
             unsafe { BorrowedFd::borrow_raw(prog_fd) }
         });
-        let _unused: Result<(), NetlinkError> =
-            unsafe { netlink_set_xdp_fd(if_index, None, prog_fd, mode) };
+        let _unused: Result<(), NetlinkError> = netlink_set_xdp_fd(if_index, None, prog_fd, mode);
         Ok(())
     }
 }
@@ -300,6 +299,7 @@ pub(crate) enum XdpLinkInner {
 
 impl Link for XdpLinkInner {
     type Id = XdpLinkIdInner;
+    type Error = Infallible;
 
     fn id(&self) -> Self::Id {
         match self {
@@ -308,7 +308,7 @@ impl Link for XdpLinkInner {
         }
     }
 
-    fn detach(self) -> Result<(), ProgramError> {
+    fn detach(self) -> Result<(), Self::Error> {
         match self {
             Self::Fd(link) => link.detach(),
             Self::NlLink(link) => link.detach(),

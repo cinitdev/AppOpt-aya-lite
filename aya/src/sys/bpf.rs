@@ -16,20 +16,20 @@ use aya_obj::{
         VarLinkage,
     },
     generated::{
-        BPF_ALU64, BPF_DW, BPF_EXIT, BPF_F_REPLACE, BPF_F_TEST_RUN_ON_CPU, BPF_IMM, BPF_JMP, BPF_K,
-        BPF_LD, BPF_MEM, BPF_MOV, BPF_PSEUDO_MAP_VALUE, BPF_ST, bpf_attach_type, bpf_attr,
-        bpf_attr__bindgen_ty_7, bpf_btf_info, bpf_cmd, bpf_insn, bpf_link_info, bpf_map_info,
-        bpf_map_type, bpf_prog_info, bpf_prog_type, bpf_stats_type,
+        BPF_ALU64, BPF_DW, BPF_EXIT, BPF_F_REPLACE, BPF_F_TEST_RUN_ON_CPU,
+        BPF_F_UPROBE_MULTI_RETURN, BPF_IMM, BPF_JMP, BPF_K, BPF_LD, BPF_MEM, BPF_MOV,
+        BPF_PSEUDO_MAP_VALUE, BPF_ST, bpf_attach_type, bpf_attr, bpf_attr__bindgen_ty_7,
+        bpf_btf_info, bpf_cmd, bpf_insn, bpf_link_info, bpf_map_info, bpf_map_type, bpf_prog_info,
+        bpf_prog_type, bpf_stats_type,
     },
     maps::{LegacyMap, bpf_map_def},
 };
 use libc::{
-    EBADF, ENOENT, ENOSPC, EPERM, RLIM_INFINITY, RLIMIT_MEMLOCK, getrlimit, rlim_t, rlimit,
-    setrlimit,
+    E2BIG, EBADF, EINVAL, ENOENT, ENOMEM, ENOSPC, EOPNOTSUPP, EPERM, RLIM_INFINITY, RLIMIT_MEMLOCK,
+    getrlimit, rlim_t, rlimit, setrlimit,
 };
 use log::warn;
 
-use super::feature_probe::{BpfHelper, is_helper_supported};
 use crate::{
     Btf, Pod, TestRunAttrs, VerifierLogLevel,
     maps::{MapData, PerCpuValues},
@@ -37,7 +37,7 @@ use crate::{
         LsmAttachType, ProgramType, RawTracePointRunOptions, RawTracePointTestRunResult,
         TestRunOptions, TestRunResult, links::LinkRef,
     },
-    sys::{Syscall, SyscallError, syscall},
+    sys::{Syscall, SyscallError, UProbeMultiFeature, syscall},
     util::KernelVersion,
 };
 
@@ -102,17 +102,17 @@ pub(crate) fn bpf_create_map(
                 // key type even when a value BTF type is provided.
                 u.btf_key_type_id = 0;
                 u.btf_value_type_id = m.def.btf_value_type_id;
-                u.btf_fd = btf_fd.map(|fd| fd.as_raw_fd()).unwrap_or_default() as u32;
+                u.btf_fd = btf_fd.map_or_default(|fd| fd.as_raw_fd()) as u32;
             }
             _ => {
                 u.btf_key_type_id = m.def.btf_key_type_id;
                 u.btf_value_type_id = m.def.btf_value_type_id;
-                u.btf_fd = btf_fd.map(|fd| fd.as_raw_fd()).unwrap_or_default() as u32;
+                u.btf_fd = btf_fd.map_or_default(|fd| fd.as_raw_fd()) as u32;
             }
         }
     }
 
-    // https://github.com/torvalds/linux/commit/ad5b177bd73f5107d97c36f56395c4281fb6f089
+    // https://github.com/torvalds/linux/commit/ad5b177bd
     // The map name was added as a parameter in kernel 4.15+ so we skip adding it on
     // older kernels for compatibility
     if KernelVersion::at_least(4, 15, 0) {
@@ -421,15 +421,27 @@ pub(crate) enum LinkTarget<'f> {
     Fd(BorrowedFd<'f>),
     IfIndex(u32),
     Iter,
+    None,
 }
 
-// Models https://github.com/torvalds/linux/blob/2144da25/include/uapi/linux/bpf.h#L1724-L1782.
+// Models https://github.com/torvalds/linux/blob/2144da255/include/uapi/linux/bpf.h#L1724-L1782.
 pub(crate) enum BpfLinkCreateArgs<'a> {
     TargetBtfId(u32),
     // since kernel 5.15
-    PerfEvent { bpf_cookie: u64 },
+    PerfEvent {
+        bpf_cookie: u64,
+    },
     // since kernel 6.6
     Tcx(&'a LinkRef),
+    // since kernel 6.6
+    UProbeMulti {
+        path: &'a CStr,
+        offsets: &'a [u64],
+        ref_ctr_offsets: Option<&'a [u64]>,
+        cookies: Option<&'a [u64]>,
+        pid: u32,
+        flags: u32,
+    },
 }
 
 // since kernel 5.7
@@ -454,8 +466,8 @@ pub(crate) fn bpf_link_create(
         // When attaching to an iterator program, no target FD is needed. In
         // fact, the kernel explicitly rejects non-zero target FDs for
         // iterators:
-        // https://github.com/torvalds/linux/blob/v6.12/kernel/bpf/bpf_iter.c#L517-L518
-        LinkTarget::Iter => {}
+        // https://github.com/torvalds/linux/blob/adc218676/kernel/bpf/bpf_iter.c#L517-L518
+        LinkTarget::Iter | LinkTarget::None => {}
     }
     attr.link_create.attach_type = attach_type.into() as u32;
     attr.link_create.flags = flags;
@@ -487,11 +499,65 @@ pub(crate) fn bpf_link_create(
                     );
                 },
             },
+            BpfLinkCreateArgs::UProbeMulti {
+                path,
+                offsets,
+                ref_ctr_offsets,
+                cookies,
+                pid,
+                flags,
+            } => {
+                let multi = unsafe { &mut attr.link_create.__bindgen_anon_3.uprobe_multi };
+                multi.path = path.as_ptr() as u64;
+                multi.offsets = offsets.as_ptr() as u64;
+                multi.cnt = offsets.len() as u32;
+                multi.flags = flags;
+                multi.pid = pid;
+                multi.ref_ctr_offsets =
+                    ref_ctr_offsets.map_or_default(|slice| slice.as_ptr() as u64);
+                multi.cookies = cookies.map_or_default(|slice| slice.as_ptr() as u64);
+            }
         }
     }
 
-    // BPF_LINK_CREATE returns a new file descriptor.
-    unsafe { fd_sys_bpf(bpf_cmd::BPF_LINK_CREATE, &mut attr) }
+    // Cgroup storage allocation can report memlock failures as ENOMEM:
+    // https://github.com/torvalds/linux/blob/b15dc4170/kernel/bpf/cgroup.c#L475-L477
+    //
+    // SAFETY: BPF_LINK_CREATE returns a new file descriptor.
+    with_raised_rlimit_retry(
+        || unsafe { fd_sys_bpf(bpf_cmd::BPF_LINK_CREATE, &mut attr) },
+        &[EPERM, ENOMEM],
+    )
+}
+
+pub(crate) fn bpf_link_create_uprobe_multi(
+    prog_fd: BorrowedFd<'_>,
+    path: &CStr,
+    offsets: &[u64],
+    ref_ctr_offsets: Option<&[u64]>,
+    cookies: Option<&[u64]>,
+    pid: u32,
+    retprobe: bool,
+) -> io::Result<crate::MockableFd> {
+    let args = BpfLinkCreateArgs::UProbeMulti {
+        path,
+        offsets,
+        ref_ctr_offsets,
+        cookies,
+        pid,
+        flags: if retprobe {
+            BPF_F_UPROBE_MULTI_RETURN
+        } else {
+            0
+        },
+    };
+    bpf_link_create(
+        prog_fd,
+        LinkTarget::None,
+        bpf_attach_type::BPF_TRACE_UPROBE_MULTI,
+        0,
+        Some(args),
+    )
 }
 
 // since kernel 5.7
@@ -528,7 +594,13 @@ pub(crate) fn bpf_prog_attach(
     attr.__bindgen_anon_5.attach_type = attach_type.into() as u32;
     attr.__bindgen_anon_5.attach_flags = flags;
 
-    unit_sys_bpf(bpf_cmd::BPF_PROG_ATTACH, &mut attr).map_err(|io_error| SyscallError {
+    // Cgroup storage allocation can report memlock failures as ENOMEM:
+    // https://github.com/torvalds/linux/blob/b15dc4170/kernel/bpf/cgroup.c#L475-L477
+    with_raised_rlimit_retry(
+        || unit_sys_bpf(bpf_cmd::BPF_PROG_ATTACH, &mut attr),
+        &[EPERM, ENOMEM],
+    )
+    .map_err(|io_error| SyscallError {
         call: "bpf_prog_attach",
         io_error,
     })
@@ -710,7 +782,7 @@ pub(crate) fn bpf_prog_test_run_tracing(prog_fd: BorrowedFd<'_>) -> Result<(), S
     // The tracing test-run handler uses a fixed synthetic call sequence instead
     // of caller-provided input. It rejects non-zero flags, CPU, and batch size,
     // so only prog_fd is set here.
-    // https://github.com/torvalds/linux/blob/v7.1-rc4/net/bpf/test_run.c#L699-L715
+    // https://github.com/torvalds/linux/blob/5200f5f49/net/bpf/test_run.c#L699-L715
     let test = unsafe { &mut attr.test };
     test.prog_fd = prog_fd.as_raw_fd() as u32;
 
@@ -718,7 +790,7 @@ pub(crate) fn bpf_prog_test_run_tracing(prog_fd: BorrowedFd<'_>) -> Result<(), S
     // For fentry/fexit, the tracing test-run handler writes 0 to attr.test.retval
     // after the fixed synthetic call sequence succeeds. That value carries no
     // extra information beyond syscall success.
-    // https://github.com/torvalds/linux/blob/v7.1-rc4/net/bpf/test_run.c#L695-L732
+    // https://github.com/torvalds/linux/blob/5200f5f49/net/bpf/test_run.c#L695-L732
     Ok(())
 }
 
@@ -733,7 +805,7 @@ fn bpf_obj_get_info_by_fd<T, F: FnOnce(&mut T)>(
     init(&mut info);
 
     attr.info.bpf_fd = fd.as_raw_fd() as u32;
-    attr.info.info = ptr::from_ref(&info) as u64;
+    attr.info.info = ptr::from_mut(&mut info) as u64;
     attr.info.info_len = size_of_val(&info) as u32;
 
     match unit_sys_bpf(bpf_cmd::BPF_OBJ_GET_INFO_BY_FD, &mut attr) {
@@ -858,13 +930,23 @@ pub(super) unsafe fn fd_sys_bpf(
 }
 
 static RAISE_MEMLIMIT: std::sync::Once = std::sync::Once::new();
-fn with_raised_rlimit_retry<T, F: FnMut() -> io::Result<T>>(mut op: F) -> io::Result<T> {
+
+fn with_raised_rlimit_retry<T, F: FnMut() -> io::Result<T>>(
+    mut op: F,
+    memlock_errnos: &[i32],
+) -> io::Result<T> {
     let mut result = op();
-    if matches!(result.as_ref(), Err(err) if err.raw_os_error() == Some(EPERM)) {
+    // Linux 5.11 stopped accounting BPF allocations against RLIMIT_MEMLOCK.
+    if !KernelVersion::at_least(5, 11, 0)
+        && matches!(
+            result.as_ref(),
+            Err(err)
+                if err
+                    .raw_os_error()
+                    .is_some_and(|errno| memlock_errnos.contains(&errno))
+        )
+    {
         RAISE_MEMLIMIT.call_once(|| {
-            if KernelVersion::at_least(5, 11, 0) {
-                return;
-            }
             let mut limit = MaybeUninit::<rlimit>::uninit();
             let ret = unsafe { getrlimit(RLIMIT_MEMLOCK, limit.as_mut_ptr()) };
             if ret != 0 {
@@ -913,7 +995,10 @@ fn with_raised_rlimit_retry<T, F: FnMut() -> io::Result<T>>(mut op: F) -> io::Re
 
 pub(super) fn bpf_map_create(attr: &mut bpf_attr) -> io::Result<crate::MockableFd> {
     // SAFETY: BPF_MAP_CREATE returns a new file descriptor.
-    with_raised_rlimit_retry(|| unsafe { fd_sys_bpf(bpf_cmd::BPF_MAP_CREATE, attr) })
+    with_raised_rlimit_retry(
+        || unsafe { fd_sys_bpf(bpf_cmd::BPF_MAP_CREATE, attr) },
+        &[EPERM],
+    )
 }
 
 pub(crate) fn bpf_btf_get_fd_by_id(id: u32) -> Result<crate::MockableFd, SyscallError> {
@@ -929,15 +1014,37 @@ pub(crate) fn bpf_btf_get_fd_by_id(id: u32) -> Result<crate::MockableFd, Syscall
     })
 }
 
-pub(crate) fn is_prog_name_supported() -> bool {
-    with_trivial_prog(ProgramType::TracePoint, |attr| {
+fn feature_probe_result(
+    result: io::Result<crate::MockableFd>,
+    unsupported_errors: &[i32],
+) -> io::Result<bool> {
+    match result.map(|_: crate::MockableFd| ()) {
+        Ok(()) => Ok(true),
+        Err(error) => {
+            if error
+                .raw_os_error()
+                .is_some_and(|errno| unsupported_errors.contains(&errno))
+            {
+                Ok(false)
+            } else {
+                Err(error)
+            }
+        }
+    }
+}
+
+pub(crate) fn probe_bpf_name() -> io::Result<bool> {
+    // Avoid making the name probe depend on CONFIG_BPF_EVENTS by using the same
+    // socket-filter carrier as libbpf.
+    // https://github.com/libbpf/libbpf/blob/20ea95b45/src/features.c#L23-L45
+    with_trivial_prog(ProgramType::SocketFilter, |attr| {
         let u = unsafe { &mut attr.__bindgen_anon_3 };
         let name = c"aya_name_check";
         let name_bytes = name.to_bytes();
         let len = cmp::min(name_bytes.len(), u.prog_name.len() - 1); // Ensure NULL termination.
         u.prog_name[..len]
             .copy_from_slice(unsafe { mem::transmute::<&[u8], &[c_char]>(&name_bytes[..len]) });
-        bpf_prog_load(attr).is_ok()
+        feature_probe_result(bpf_prog_load(attr), &[EINVAL, E2BIG])
     })
 }
 
@@ -964,12 +1071,12 @@ where
     u.insn_cnt = insns.len() as u32;
     u.insns = insns.as_ptr() as u64;
 
-    // `expected_attach_type` field was added in v4.17 https://elixir.bootlin.com/linux/v4.17/source/include/uapi/linux/bpf.h#L310.
+    // `expected_attach_type` field was added in v4.17 https://github.com/torvalds/linux/blob/29dcea887/include/uapi/linux/bpf.h#L310.
     let expected_attach_type = match program_type {
         ProgramType::SkMsg => Some(bpf_attach_type::BPF_SK_MSG_VERDICT),
         // `CONNECT` is a broader probe target than `BIND`: some sock_addr helpers, such as
         // `bpf_bind`, are available from connect hooks but not bind hooks.
-        // https://github.com/libbpf/libbpf/blob/v1.7.0/src/libbpf_probes.c#L116-L119
+        // https://github.com/libbpf/libbpf/blob/f5dcbae73/src/libbpf_probes.c#L116-L119
         ProgramType::CgroupSockAddr => Some(bpf_attach_type::BPF_CGROUP_INET4_CONNECT),
         ProgramType::LircMode2 => Some(bpf_attach_type::BPF_LIRC_MODE2),
         ProgramType::SkReuseport => Some(bpf_attach_type::BPF_SK_REUSEPORT_SELECT),
@@ -1018,7 +1125,7 @@ where
                 u.kern_version = current_version.code();
             }
         }
-        // syscall required to be sleepable: https://elixir.bootlin.com/linux/v5.14/source/kernel/bpf/verifier.c#L13240
+        // syscall required to be sleepable: https://github.com/torvalds/linux/blob/7d2a07b76/kernel/bpf/verifier.c#L13240
         ProgramType::Syscall => u.prog_flags = aya_obj::generated::BPF_F_SLEEPABLE,
         _ => {}
     }
@@ -1043,37 +1150,108 @@ where
     with_prog_insns(program_type, &insns, op)
 }
 
-pub(crate) fn is_probe_read_kernel_supported() -> bool {
-    matches!(
-        is_helper_supported(
-            ProgramType::TracePoint,
-            BpfHelper::BPF_FUNC_probe_read_kernel
-        ),
-        Ok(true)
-    )
-}
-
-pub(crate) fn is_perf_link_supported() -> bool {
+pub(crate) fn probe_perf_link() -> io::Result<bool> {
     with_trivial_prog(ProgramType::TracePoint, |attr| {
-        if let Ok(fd) = bpf_prog_load(attr) {
-            let fd = fd.as_fd();
-            // Uses an invalid target FD so we get EBADF if supported.
-            let link = bpf_link_create(
-                fd,
-                LinkTarget::IfIndex(u32::MAX),
-                bpf_attach_type::BPF_PERF_EVENT,
-                0,
-                None,
-            );
+        let fd = match bpf_prog_load(attr) {
+            Ok(fd) => fd,
+            Err(error) => match error.raw_os_error() {
+                Some(EINVAL | E2BIG) => return Ok(false),
+                _ => return Err(error),
+            },
+        };
+        let fd = fd.as_fd();
+        // Uses an invalid target FD so we get EBADF if supported.
+        let link = bpf_link_create(
+            fd,
+            LinkTarget::IfIndex(u32::MAX),
+            bpf_attach_type::BPF_PERF_EVENT,
+            0,
+            None,
+        );
+        match link.map(|_: crate::MockableFd| ()) {
+            Ok(()) => Ok(true),
             // Returns EINVAL if unsupported. EBADF if supported.
-            matches!(link, Err(err) if err.raw_os_error() == Some(EBADF))
-        } else {
-            false
+            Err(error) => match error.raw_os_error() {
+                Some(EBADF) => Ok(true),
+                Some(EINVAL) => Ok(false),
+                _ => Err(error),
+            },
         }
     })
 }
 
-pub(crate) fn is_bpf_global_data_supported() -> bool {
+pub(crate) fn probe_uprobe_multi_link(feature: UProbeMultiFeature) -> io::Result<bool> {
+    with_trivial_prog(ProgramType::KProbe, |attr| {
+        let u = unsafe { &mut attr.__bindgen_anon_3 };
+        u.expected_attach_type = bpf_attach_type::BPF_TRACE_UPROBE_MULTI as u32;
+
+        let prog_fd = match bpf_prog_load(attr) {
+            Ok(fd) => fd,
+            // The probe program is known to be valid, so these errors mean the kernel does not
+            // accept the required program type or load attribute. Any other error means the probe
+            // itself failed.
+            Err(error) => match error.raw_os_error() {
+                Some(EINVAL | E2BIG) => return Ok(false),
+                _ => return Err(error),
+            },
+        };
+        let prog_fd = prog_fd.as_fd();
+        let path = c"/";
+        let offsets = [0];
+        let create_link = |pid| {
+            let args = BpfLinkCreateArgs::UProbeMulti {
+                path,
+                offsets: &offsets,
+                ref_ctr_offsets: None,
+                cookies: None,
+                pid,
+                flags: 0,
+            };
+            bpf_link_create(
+                prog_fd,
+                LinkTarget::None,
+                bpf_attach_type::BPF_TRACE_UPROBE_MULTI,
+                0,
+                Some(args),
+            )
+        };
+
+        // Follow libbpf's basic-link probe. "/" resolves to a directory, so a kernel that
+        // dispatches BPF_TRACE_UPROBE_MULTI reaches the regular-file check and returns EBADF.
+        // https://github.com/libbpf/libbpf/blob/f5dcbae73/src/features.c#L362-L395
+        // https://github.com/torvalds/linux/blob/89ae89f53/kernel/trace/bpf_trace.c#L3119-L3133
+        match create_link(0).map(|_: crate::MockableFd| ()) {
+            Ok(()) => return Ok(false),
+            Err(error) => match error.raw_os_error() {
+                Some(EBADF) => {}
+                Some(EINVAL | EOPNOTSUPP) => return Ok(false),
+                _ => return Err(error),
+            },
+        }
+
+        if matches!(feature, UProbeMultiFeature::LinkCreation) {
+            return Ok(true);
+        }
+
+        // Follow libbpf's probe for the process-scoped PID-filter fix. Fixed kernels reject
+        // pid == -1 with EINVAL before resolving "/", while affected kernels inspect the path
+        // first and return EBADF. The same fix changes runtime filtering from task identity to
+        // address-space identity.
+        // https://github.com/libbpf/libbpf/blob/f5dcbae73/src/features.c#L397-L424
+        // https://github.com/torvalds/linux/commit/46ba0e49b
+        let invalid_pid: u32 = -1i32 as u32;
+        match create_link(invalid_pid).map(|_: crate::MockableFd| ()) {
+            Ok(()) => Ok(false),
+            Err(error) => match error.raw_os_error() {
+                Some(EINVAL) => Ok(true),
+                Some(EBADF | EOPNOTSUPP) => Ok(false),
+                _ => Err(error),
+            },
+        }
+    })
+}
+
+pub(crate) fn probe_bpf_global_data() -> io::Result<bool> {
     let mut attr = unsafe { mem::zeroed::<bpf_attr>() };
     let u = unsafe { &mut attr.__bindgen_anon_3 };
 
@@ -1094,44 +1272,34 @@ pub(crate) fn is_bpf_global_data_supported() -> bool {
         }),
         "aya_global",
         None,
-    );
-
-    if let Ok(map) = map {
-        let ld_map_value = (BPF_LD | BPF_DW | BPF_IMM) as u8;
-        let pseudo_map_value = BPF_PSEUDO_MAP_VALUE as u8;
-        let fd = map.fd().as_fd().as_raw_fd();
-        let st_mem = (BPF_ST | BPF_DW | BPF_MEM) as u8;
-        let mov64_imm = (BPF_ALU64 | BPF_MOV | BPF_K) as u8;
-        let exit = (BPF_JMP | BPF_EXIT) as u8;
-        let insns = [
-            new_insn(ld_map_value, 1, pseudo_map_value, 0, fd),
-            new_insn(0, 0, 0, 0, 0),
-            new_insn(st_mem, 1, 0, 0, 42),
-            new_insn(mov64_imm, 0, 0, 0, 0),
-            new_insn(exit, 0, 0, 0, 0),
-        ];
-
-        let gpl = c"GPL";
-        u.license = gpl.as_ptr() as u64;
-        u.insn_cnt = insns.len() as u32;
-        u.insns = insns.as_ptr() as u64;
-        u.prog_type = bpf_prog_type::BPF_PROG_TYPE_SOCKET_FILTER as u32;
-
-        bpf_prog_load(&mut attr).is_ok()
-    } else {
-        false
-    }
-}
-
-pub(crate) fn is_bpf_cookie_supported() -> bool {
-    matches!(
-        is_helper_supported(ProgramType::KProbe, BpfHelper::BPF_FUNC_get_attach_cookie),
-        Ok(true)
     )
+    .map_err(io::Error::other)?;
+
+    let ld_map_value = (BPF_LD | BPF_DW | BPF_IMM) as u8;
+    let pseudo_map_value = BPF_PSEUDO_MAP_VALUE as u8;
+    let fd = map.fd().as_fd().as_raw_fd();
+    let st_mem = (BPF_ST | BPF_DW | BPF_MEM) as u8;
+    let mov64_imm = (BPF_ALU64 | BPF_MOV | BPF_K) as u8;
+    let exit = (BPF_JMP | BPF_EXIT) as u8;
+    let insns = [
+        new_insn(ld_map_value, 1, pseudo_map_value, 0, fd),
+        new_insn(0, 0, 0, 0, 0),
+        new_insn(st_mem, 1, 0, 0, 42),
+        new_insn(mov64_imm, 0, 0, 0, 0),
+        new_insn(exit, 0, 0, 0, 0),
+    ];
+
+    let gpl = c"GPL";
+    u.license = gpl.as_ptr() as u64;
+    u.insn_cnt = insns.len() as u32;
+    u.insns = insns.as_ptr() as u64;
+    u.prog_type = bpf_prog_type::BPF_PROG_TYPE_SOCKET_FILTER as u32;
+
+    feature_probe_result(bpf_prog_load(&mut attr), &[EINVAL, E2BIG])
 }
 
 /// Tests whether [`CpuMap`], [`DevMap`] and [`DevMapHash`] support program ids.
-pub(crate) fn is_prog_id_supported(map_type: bpf_map_type) -> bool {
+pub(crate) fn probe_prog_id(map_type: bpf_map_type) -> io::Result<bool> {
     assert_matches!(
         map_type,
         bpf_map_type::BPF_MAP_TYPE_CPUMAP
@@ -1148,19 +1316,22 @@ pub(crate) fn is_prog_id_supported(map_type: bpf_map_type) -> bool {
     u.max_entries = 1;
     u.map_flags = 0;
 
-    bpf_map_create(&mut attr).is_ok()
+    feature_probe_result(bpf_map_create(&mut attr), &[EINVAL])
 }
 
-pub(crate) fn is_btf_supported() -> bool {
+pub(crate) fn probe_btf() -> io::Result<bool> {
     let mut btf = Btf::new();
     let name_offset = btf.add_string("int");
     let int_type = BtfType::Int(Int::new(name_offset, 4, IntEncoding::Signed, 0));
     btf.add_type(int_type);
     let btf_bytes = btf.to_bytes();
-    bpf_load_btf(btf_bytes.as_slice(), &mut [], Default::default()).is_ok()
+    feature_probe_result(
+        bpf_load_btf(btf_bytes.as_slice(), &mut [], Default::default()),
+        &[EINVAL],
+    )
 }
 
-pub(crate) fn is_btf_func_supported() -> bool {
+pub(crate) fn probe_btf_func() -> io::Result<bool> {
     let mut btf = Btf::new();
     let name_offset = btf.add_string("int");
     let int_type = BtfType::Int(Int::new(name_offset, 4, IntEncoding::Signed, 0));
@@ -1187,10 +1358,13 @@ pub(crate) fn is_btf_func_supported() -> bool {
 
     let btf_bytes = btf.to_bytes();
 
-    bpf_load_btf(btf_bytes.as_slice(), &mut [], Default::default()).is_ok()
+    feature_probe_result(
+        bpf_load_btf(btf_bytes.as_slice(), &mut [], Default::default()),
+        &[EINVAL],
+    )
 }
 
-pub(crate) fn is_btf_func_global_supported() -> bool {
+pub(crate) fn probe_btf_func_global() -> io::Result<bool> {
     let mut btf = Btf::new();
     let name_offset = btf.add_string("int");
     let int_type = BtfType::Int(Int::new(name_offset, 4, IntEncoding::Signed, 0));
@@ -1217,10 +1391,13 @@ pub(crate) fn is_btf_func_global_supported() -> bool {
 
     let btf_bytes = btf.to_bytes();
 
-    bpf_load_btf(btf_bytes.as_slice(), &mut [], Default::default()).is_ok()
+    feature_probe_result(
+        bpf_load_btf(btf_bytes.as_slice(), &mut [], Default::default()),
+        &[EINVAL],
+    )
 }
 
-pub(crate) fn is_btf_datasec_supported() -> bool {
+pub(crate) fn probe_btf_datasec() -> io::Result<bool> {
     let mut btf = Btf::new();
     let name_offset = btf.add_string("int");
     let int_type = BtfType::Int(Int::new(name_offset, 4, IntEncoding::Signed, 0));
@@ -1241,19 +1418,27 @@ pub(crate) fn is_btf_datasec_supported() -> bool {
 
     let btf_bytes = btf.to_bytes();
 
-    bpf_load_btf(btf_bytes.as_slice(), &mut [], Default::default()).is_ok()
+    feature_probe_result(
+        bpf_load_btf(btf_bytes.as_slice(), &mut [], Default::default()),
+        &[EINVAL],
+    )
 }
 
-pub(crate) fn is_btf_datasec_zero_supported() -> bool {
+pub(crate) fn probe_btf_datasec_zero() -> io::Result<bool> {
     let mut btf = Btf::new();
     let name_offset = btf.add_string(".empty");
-    let datasec_type = BtfType::DataSec(DataSec::new(name_offset, Vec::new(), 0));
+    // Linux 5.12 allowed DATASECs with zero entries; their section size must still be non-zero.
+    // https://github.com/torvalds/linux/commit/13ca51d5e
+    let datasec_type = BtfType::DataSec(DataSec::new(name_offset, Vec::new(), 4));
     btf.add_type(datasec_type);
 
-    bpf_load_btf(btf.to_bytes().as_slice(), &mut [], Default::default()).is_ok()
+    feature_probe_result(
+        bpf_load_btf(btf.to_bytes().as_slice(), &mut [], Default::default()),
+        &[EINVAL],
+    )
 }
 
-pub(crate) fn is_btf_enum64_supported() -> bool {
+pub(crate) fn probe_btf_enum64() -> io::Result<bool> {
     let mut btf = Btf::new();
     let name_offset = btf.add_string("enum64");
 
@@ -1266,10 +1451,13 @@ pub(crate) fn is_btf_enum64_supported() -> bool {
 
     let btf_bytes = btf.to_bytes();
 
-    bpf_load_btf(btf_bytes.as_slice(), &mut [], Default::default()).is_ok()
+    feature_probe_result(
+        bpf_load_btf(btf_bytes.as_slice(), &mut [], Default::default()),
+        &[EINVAL],
+    )
 }
 
-pub(crate) fn is_btf_float_supported() -> bool {
+pub(crate) fn probe_btf_float() -> io::Result<bool> {
     let mut btf = Btf::new();
     let name_offset = btf.add_string("float");
     let float_type = BtfType::Float(Float::new(name_offset, 16));
@@ -1277,10 +1465,13 @@ pub(crate) fn is_btf_float_supported() -> bool {
 
     let btf_bytes = btf.to_bytes();
 
-    bpf_load_btf(btf_bytes.as_slice(), &mut [], Default::default()).is_ok()
+    feature_probe_result(
+        bpf_load_btf(btf_bytes.as_slice(), &mut [], Default::default()),
+        &[EINVAL],
+    )
 }
 
-pub(crate) fn is_btf_decl_tag_supported() -> bool {
+pub(crate) fn probe_btf_decl_tag() -> io::Result<bool> {
     let mut btf = Btf::new();
     let name_offset = btf.add_string("int");
     let int_type = BtfType::Int(Int::new(name_offset, 4, IntEncoding::Signed, 0));
@@ -1296,10 +1487,13 @@ pub(crate) fn is_btf_decl_tag_supported() -> bool {
 
     let btf_bytes = btf.to_bytes();
 
-    bpf_load_btf(btf_bytes.as_slice(), &mut [], Default::default()).is_ok()
+    feature_probe_result(
+        bpf_load_btf(btf_bytes.as_slice(), &mut [], Default::default()),
+        &[EINVAL],
+    )
 }
 
-pub(crate) fn is_btf_type_tag_supported() -> bool {
+pub(crate) fn probe_btf_type_tag() -> io::Result<bool> {
     let mut btf = Btf::new();
 
     let int_type = BtfType::Int(Int::new(0, 4, IntEncoding::Signed, 0));
@@ -1313,12 +1507,39 @@ pub(crate) fn is_btf_type_tag_supported() -> bool {
 
     let btf_bytes = btf.to_bytes();
 
-    bpf_load_btf(btf_bytes.as_slice(), &mut [], Default::default()).is_ok()
+    feature_probe_result(
+        bpf_load_btf(btf_bytes.as_slice(), &mut [], Default::default()),
+        &[EINVAL],
+    )
 }
 
+const BPF_PROG_LOAD_ATTEMPTS: usize = 5;
+
 pub(super) fn bpf_prog_load(attr: &mut bpf_attr) -> io::Result<crate::MockableFd> {
-    // SAFETY: BPF_PROG_LOAD returns a new file descriptor.
-    with_raised_rlimit_retry(|| unsafe { fd_sys_bpf(bpf_cmd::BPF_PROG_LOAD, attr) })
+    // The verifier aborts program verification with EAGAIN when a signal is pending so that it
+    // can release the resources used by the current verification attempt:
+    // https://github.com/torvalds/linux/blob/c3494801c/kernel/bpf/verifier.c#L5151-L5155
+    // Match libbpf by retrying this transient failure, with a bounded attempt count so that
+    // continuously delivered signals cannot cause an infinite loop:
+    // https://github.com/libbpf/libbpf/blob/f7081a6ba/src/bpf.c#L125-L133
+    // https://github.com/torvalds/linux/commit/d6d418bd8
+    let mut attempts = BPF_PROG_LOAD_ATTEMPTS;
+    loop {
+        // SAFETY: BPF_PROG_LOAD returns a new file descriptor.
+        let result = with_raised_rlimit_retry(
+            || unsafe { fd_sys_bpf(bpf_cmd::BPF_PROG_LOAD, attr) },
+            &[EPERM],
+        );
+        if attempts == 1
+            || !matches!(
+                result.as_ref(),
+                Err(error) if error.raw_os_error() == Some(libc::EAGAIN)
+            )
+        {
+            return result;
+        }
+        attempts -= 1;
+    }
 }
 
 fn sys_bpf(cmd: bpf_cmd, attr: &mut bpf_attr) -> io::Result<i64> {
@@ -1412,18 +1633,17 @@ pub(crate) fn retry_with_verifier_logs<T>(
     let mut retries = 0;
     loop {
         let ret = f(log_buf.as_mut_slice());
-        if retries != max_retries {
-            if let Err(io_error) = &ret {
-                if retries == 0 || io_error.raw_os_error() == Some(ENOSPC) {
-                    let len = (log_buf.capacity() * 10).clamp(MIN_LOG_BUF_SIZE, MAX_LOG_BUF_SIZE);
-                    log_buf.resize(len, 0);
-                    if let Some(first) = log_buf.first_mut() {
-                        *first = 0;
-                    }
-                    retries += 1;
-                    continue;
-                }
+        if retries != max_retries
+            && let Err(io_error) = &ret
+            && (retries == 0 || io_error.raw_os_error() == Some(ENOSPC))
+        {
+            let len = (log_buf.capacity() * 10).clamp(MIN_LOG_BUF_SIZE, MAX_LOG_BUF_SIZE);
+            log_buf.resize(len, 0);
+            if let Some(first) = log_buf.first_mut() {
+                *first = 0;
             }
+            retries += 1;
+            continue;
         }
         if let Some(pos) = log_buf.iter().position(|b| *b == 0) {
             log_buf.truncate(pos);
@@ -1436,14 +1656,64 @@ pub(crate) fn retry_with_verifier_logs<T>(
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use aya_obj::{
         generated::bpf_map_type::BPF_MAP_TYPE_BLOOM_FILTER, maps::PinningType, obj::parse_map_info,
     };
-    use libc::EINVAL;
+    use libc::EIO;
     use rstest::rstest;
 
     use super::*;
-    use crate::sys::override_syscall;
+    use crate::sys::{SysResult, override_syscall};
+
+    thread_local! {
+        static BPF_PROG_LOAD_CALLS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    #[test]
+    fn test_bpf_prog_load_retries_eagain_then_succeeds() {
+        BPF_PROG_LOAD_CALLS.set(0);
+        override_syscall(|call| match call {
+            Syscall::Ebpf {
+                cmd: bpf_cmd::BPF_PROG_LOAD,
+                attr: _,
+            } => {
+                let calls = BPF_PROG_LOAD_CALLS.get() + 1;
+                BPF_PROG_LOAD_CALLS.set(calls);
+                if calls == 1 {
+                    Err((-1, io::Error::from_raw_os_error(libc::EAGAIN)))
+                } else {
+                    Ok(crate::MockableFd::mock_signed_fd().into())
+                }
+            }
+            unexpected => panic!("unexpected syscall: {unexpected:?}"),
+        });
+
+        let mut attr = unsafe { mem::zeroed() };
+        bpf_prog_load(&mut attr).unwrap();
+        assert_eq!(BPF_PROG_LOAD_CALLS.get(), 2);
+    }
+
+    #[test]
+    fn test_bpf_prog_load_stops_after_attempt_limit() {
+        BPF_PROG_LOAD_CALLS.set(0);
+        override_syscall(|call| match call {
+            Syscall::Ebpf {
+                cmd: bpf_cmd::BPF_PROG_LOAD,
+                attr: _,
+            } => {
+                BPF_PROG_LOAD_CALLS.set(BPF_PROG_LOAD_CALLS.get() + 1);
+                Err((-1, io::Error::from_raw_os_error(libc::EAGAIN)))
+            }
+            unexpected => panic!("unexpected syscall: {unexpected:?}"),
+        });
+
+        let mut attr = unsafe { mem::zeroed() };
+        let error = bpf_prog_load(&mut attr).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EAGAIN));
+        assert_eq!(BPF_PROG_LOAD_CALLS.get(), BPF_PROG_LOAD_ATTEMPTS);
+    }
 
     #[test]
     fn test_attach_with_attributes() {
@@ -1497,7 +1767,7 @@ mod tests {
             } => Err((-1, io::Error::from_raw_os_error(EBADF))),
             _ => Ok(crate::MockableFd::mock_signed_fd().into()),
         });
-        let supported = is_perf_link_supported();
+        let supported = probe_perf_link().unwrap();
         assert!(supported);
 
         override_syscall(|call| match call {
@@ -1507,32 +1777,90 @@ mod tests {
             } => Err((-1, io::Error::from_raw_os_error(EINVAL))),
             _ => Ok(crate::MockableFd::mock_signed_fd().into()),
         });
-        let supported = is_perf_link_supported();
+        let supported = probe_perf_link().unwrap();
         assert!(!supported);
+
+        override_syscall(|call| match call {
+            Syscall::Ebpf {
+                cmd: bpf_cmd::BPF_LINK_CREATE,
+                ..
+            } => Err((-1, io::Error::from_raw_os_error(EIO))),
+            _ => Ok(crate::MockableFd::mock_signed_fd().into()),
+        });
+        let error = probe_perf_link().unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(EIO));
+    }
+
+    // A kernel can support multi-uprobe links while still having the PID filtering bug.
+    // Verify that the probe reports LinkCreation as supported and ProcessScopedPidFilter
+    // as unsupported on such kernels.
+    #[test]
+    fn test_probe_uprobe_multi_detects_pid_filter_bug() {
+        fn mock_syscall<const INVALID_PID_ERROR: i32>(call: Syscall<'_>) -> SysResult {
+            match call {
+                Syscall::Ebpf {
+                    cmd: bpf_cmd::BPF_PROG_LOAD,
+                    attr: _,
+                } => Ok(crate::MockableFd::mock_signed_fd().into()),
+                Syscall::Ebpf {
+                    cmd: bpf_cmd::BPF_LINK_CREATE,
+                    attr,
+                } => {
+                    let link_create = unsafe { &attr.link_create };
+                    assert_eq!(
+                        link_create.attach_type,
+                        bpf_attach_type::BPF_TRACE_UPROBE_MULTI as u32
+                    );
+                    let multi = unsafe { &link_create.__bindgen_anon_3.uprobe_multi };
+                    assert_eq!(unsafe { CStr::from_ptr(multi.path as *const c_char) }, c"/");
+                    let error = match multi.pid {
+                        0 => EBADF,
+                        u32::MAX => INVALID_PID_ERROR,
+                        pid => panic!("unexpected PID {pid}"),
+                    };
+                    Err((-1, io::Error::from_raw_os_error(error)))
+                }
+                call => panic!("unexpected syscall {call:?}"),
+            }
+        }
+
+        // Simulate the buggy kernel returning EBADF for both the basic and invalid-PID probes.
+        override_syscall(mock_syscall::<EBADF>);
+        assert!(probe_uprobe_multi_link(UProbeMultiFeature::LinkCreation).unwrap());
+        assert!(!probe_uprobe_multi_link(UProbeMultiFeature::ProcessScopedPidFilter).unwrap());
+
+        // As a positive control, simulate a fixed kernel returning EINVAL for the invalid PID.
+        override_syscall(mock_syscall::<EINVAL>);
+        assert!(probe_uprobe_multi_link(UProbeMultiFeature::LinkCreation).unwrap());
+        assert!(probe_uprobe_multi_link(UProbeMultiFeature::ProcessScopedPidFilter).unwrap());
     }
 
     #[test]
     fn test_prog_id_supported() {
-        override_syscall(|_call| Ok(crate::MockableFd::mock_signed_fd().into()));
+        override_syscall(|_: Syscall<'_>| Ok(crate::MockableFd::mock_signed_fd().into()));
 
         // Ensure that the three map types we can check are accepted
-        let supported = is_prog_id_supported(bpf_map_type::BPF_MAP_TYPE_CPUMAP);
+        let supported = probe_prog_id(bpf_map_type::BPF_MAP_TYPE_CPUMAP).unwrap();
         assert!(supported);
-        let supported = is_prog_id_supported(bpf_map_type::BPF_MAP_TYPE_DEVMAP);
+        let supported = probe_prog_id(bpf_map_type::BPF_MAP_TYPE_DEVMAP).unwrap();
         assert!(supported);
-        let supported = is_prog_id_supported(bpf_map_type::BPF_MAP_TYPE_DEVMAP_HASH);
+        let supported = probe_prog_id(bpf_map_type::BPF_MAP_TYPE_DEVMAP_HASH).unwrap();
         assert!(supported);
 
-        override_syscall(|_call| Err((-1, io::Error::from_raw_os_error(EINVAL))));
-        let supported = is_prog_id_supported(bpf_map_type::BPF_MAP_TYPE_CPUMAP);
+        override_syscall(|_: Syscall<'_>| Err((-1, io::Error::from_raw_os_error(EINVAL))));
+        let supported = probe_prog_id(bpf_map_type::BPF_MAP_TYPE_CPUMAP).unwrap();
         assert!(!supported);
+
+        override_syscall(|_: Syscall<'_>| Err((-1, io::Error::from_raw_os_error(EIO))));
+        let error = probe_prog_id(bpf_map_type::BPF_MAP_TYPE_CPUMAP).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(EIO));
     }
 
     #[test]
     #[should_panic = "assertion failed: `BPF_MAP_TYPE_HASH` does not match `bpf_map_type::BPF_MAP_TYPE_CPUMAP | bpf_map_type::BPF_MAP_TYPE_DEVMAP |
 bpf_map_type::BPF_MAP_TYPE_DEVMAP_HASH`"]
     fn test_prog_id_supported_reject_types() {
-        is_prog_id_supported(bpf_map_type::BPF_MAP_TYPE_HASH);
+        drop(probe_prog_id(bpf_map_type::BPF_MAP_TYPE_HASH));
     }
 
     #[test]

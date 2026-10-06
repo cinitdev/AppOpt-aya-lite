@@ -200,7 +200,7 @@ pub struct NlOptions {
     /// When [`None`], no attribute is sent and the filter is not bound to a
     /// class.
     ///
-    /// [`3a461da1d03e`]: https://github.com/torvalds/linux/commit/3a461da1d03e7a857edfa6a002040d07e118c639
+    /// [`3a461da1d03e`]: https://github.com/torvalds/linux/commit/3a461da1d
     #[doc(alias = "TCA_BPF_CLASSID")]
     pub classid: Option<TcHandle>,
 }
@@ -374,18 +374,16 @@ impl SchedClassifier {
                 let name = self.data.name.as_deref().unwrap_or_default();
                 // TODO: avoid this unwrap by adding a new error variant.
                 let name = CString::new(name).unwrap();
-                let (priority, handle) = unsafe {
-                    netlink_qdisc_attach(
-                        if_index as i32,
-                        &attach_type,
-                        prog_fd,
-                        &name,
-                        options.priority,
-                        options.handle,
-                        options.classid,
-                        create,
-                    )
-                }
+                let (priority, handle) = netlink_qdisc_attach(
+                    if_index as i32,
+                    attach_type,
+                    prog_fd,
+                    &name,
+                    options.priority,
+                    options.handle,
+                    options.classid,
+                    create,
+                )
                 .map_err(TcError::NetlinkError)?;
 
                 self.data
@@ -485,21 +483,22 @@ pub(crate) struct NlLink {
 
 impl Link for NlLink {
     type Id = NlLinkId;
+    type Error = ProgramError;
 
     fn id(&self) -> Self::Id {
         NlLinkId(self.if_index, self.attach_type, self.priority, self.handle)
     }
 
-    fn detach(self) -> Result<(), ProgramError> {
-        unsafe {
-            netlink_qdisc_detach(
-                self.if_index as i32,
-                self.attach_type,
-                self.priority,
-                self.handle,
-            )
-        }
-        .map_err(ProgramError::NetlinkError)?;
+    fn detach(self) -> Result<(), Self::Error> {
+        let Self {
+            if_index,
+            attach_type,
+            priority,
+            handle,
+            classid: _classid,
+        } = self;
+        netlink_qdisc_detach(if_index as i32, attach_type, priority, handle)
+            .map_err(ProgramError::NetlinkError)?;
         Ok(())
     }
 }
@@ -520,6 +519,7 @@ pub(crate) enum TcLinkInner {
 
 impl Link for TcLinkInner {
     type Id = TcLinkIdInner;
+    type Error = ProgramError;
 
     fn id(&self) -> Self::Id {
         match self {
@@ -528,9 +528,9 @@ impl Link for TcLinkInner {
         }
     }
 
-    fn detach(self) -> Result<(), ProgramError> {
+    fn detach(self) -> Result<(), Self::Error> {
         match self {
-            Self::Fd(link) => link.detach(),
+            Self::Fd(link) => link.detach().map_err(Into::into),
             Self::NlLink(link) => link.detach(),
         }
     }
@@ -659,7 +659,7 @@ impl SchedClassifierLink {
 /// programs can be attached.
 pub fn qdisc_add_clsact(if_name: &str) -> Result<(), TcError> {
     let if_index = ifindex_from_ifname(if_name)?;
-    unsafe { netlink_qdisc_add_clsact(if_index as i32).map_err(TcError::NetlinkError) }
+    netlink_qdisc_add_clsact(if_index as i32).map_err(TcError::NetlinkError)
 }
 
 /// Detaches the programs with the given name.
@@ -689,7 +689,7 @@ pub fn qdisc_detach_program(
     }
 
     for (prio, handle) in filter_info {
-        unsafe { netlink_qdisc_detach(if_index, attach_type, prio, handle)? }
+        netlink_qdisc_detach(if_index, attach_type, prio, handle)?;
     }
 
     Ok(())
