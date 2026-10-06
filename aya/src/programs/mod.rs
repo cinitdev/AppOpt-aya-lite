@@ -73,20 +73,9 @@ pub mod trace_point;
 pub mod uprobe;
 pub mod xdp;
 
-// `libc` exposes `SO_ATTACH_REUSEPORT_EBPF` on all architectures, but
-// `SO_DETACH_REUSEPORT_BPF` is still commented out in libc's
-// `src/unix/linux_like/linux/arch/{mips,powerpc,sparc}/mod.rs`.
-// The values below are the asm-generic constants (52 and 68), which are
-// correct for every architecture aya supports; sparc uses different values
-// but aya does not target sparc. Both are defined locally to keep them
-// consistent rather than mixing a libc constant with a hand-written one.
-// TODO(https://github.com/rust-lang/libc/commit/95c9572): use libc's
-// constants once this lands in a released libc version.
-pub(crate) const SO_ATTACH_REUSEPORT_EBPF: libc::c_int = 52;
-pub(crate) const SO_DETACH_REUSEPORT_BPF: libc::c_int = 68;
-
 use std::{
     borrow::Cow,
+    convert::Infallible,
     ffi::CString,
     io,
     os::fd::{AsFd, BorrowedFd},
@@ -145,10 +134,12 @@ use crate::{
     pin::PinError,
     programs::{
         links::{
-            FdLink, FdLinkId, LinkError, LinkInfo, Links, ProgAttachLink, ProgAttachLinkId,
-            define_link_wrapper, id_as_key, impl_try_from_fdlink, impl_try_into_fdlink,
+            FdLink, FdLinkId, LinkError, LinkInfo, Links, ProgAttachLink, define_link_wrapper,
+            id_as_key, impl_try_from_fdlink, impl_try_into_fdlink,
         },
-        perf_attach::{PerfLinkIdInner, PerfLinkInner, perf_attach, perf_attach_debugfs},
+        perf_attach::{
+            PerfLink, PerfLinkIdInner, PerfLinkInner, attach_bpf_link, attach_perf_event,
+        },
     },
     sys::{
         EbpfLoadProgramAttrs, NetlinkError, ProgQueryTarget, SyscallError, bpf_btf_get_fd_by_id,
@@ -191,6 +182,10 @@ pub enum ProgramError {
     /// A syscall failed.
     #[error(transparent)]
     SyscallError(#[from] SyscallError),
+
+    /// An error occurred while working with a link.
+    #[error(transparent)]
+    LinkError(#[from] LinkError),
 
     /// The network interface does not exist.
     #[error("unknown network interface {name}")]
@@ -261,6 +256,12 @@ pub enum ProgramError {
     /// An error occurred while working with Netlink.
     #[error(transparent)]
     NetlinkError(#[from] NetlinkError),
+}
+
+impl From<Infallible> for ProgramError {
+    fn from(error: Infallible) -> Self {
+        match error {}
+    }
 }
 
 /// A [`Program`] file descriptor.
@@ -389,7 +390,7 @@ impl Program {
             // - `BPF_TRACE_FEXIT` (`FExit`)
             // - `BPF_TRACE_ITER` (`Iter`)
             //
-            // https://github.com/torvalds/linux/blob/v6.12/kernel/bpf/syscall.c#L3935-L3940
+            // https://github.com/torvalds/linux/blob/adc218676/kernel/bpf/syscall.c#L3935-L3940
             Self::BtfTracePoint(_) | Self::FEntry(_) | Self::FExit(_) | Self::Iter(_) => {
                 ProgramType::Tracing
             }
@@ -1038,7 +1039,7 @@ pub struct RawTracePointRunOptions {
     ///
     /// The array size of 12 matches the kernel's maximum: the longest tracepoint
     /// in the kernel takes 12 arguments. See
-    /// [`net/bpf/test_run.c`](https://github.com/torvalds/linux/blob/d91a46d680/net/bpf/test_run.c#L762).
+    /// [`net/bpf/test_run.c`](https://github.com/torvalds/linux/blob/d91a46d68/net/bpf/test_run.c#L762).
     pub args: [u64; 12],
     /// If `Some(cpu)`, pin execution to that CPU via `BPF_F_TEST_RUN_ON_CPU`.
     ///
@@ -1172,7 +1173,7 @@ impl TestRun for FExit {
     // The kernel tracing test-run handler uses a fixed synthetic fentry/fexit
     // call sequence; packet data, context data, repeat count, CPU pinning, and
     // batch flags do not apply.
-    // https://github.com/torvalds/linux/blob/v7.1-rc4/net/bpf/test_run.c#L690-L735
+    // https://github.com/torvalds/linux/blob/5200f5f49/net/bpf/test_run.c#L690-L735
     type Opts<'a> = ();
     // For fentry/fexit, test-run success only reports that the kernel's fixed
     // synthetic call sequence ran.
@@ -1184,7 +1185,7 @@ impl TestRun for FExit {
 }
 
 /// Trait implemented by the [`Program`] types which support the kernel's
-/// [generic multi-prog API](https://github.com/torvalds/linux/commit/053c8e1f235dc3f69d13375b32f4209228e1cb96).
+/// [generic multi-prog API](https://github.com/torvalds/linux/commit/053c8e1f2).
 ///
 /// # Minimum kernel version
 ///
@@ -1209,7 +1210,7 @@ macro_rules! impl_multiprog_fd {
 impl_multiprog_fd!(SchedClassifier);
 
 /// Trait implemented by the [`Link`] types which support the kernel's
-/// [generic multi-prog API](https://github.com/torvalds/linux/commit/053c8e1f235dc3f69d13375b32f4209228e1cb96).
+/// [generic multi-prog API](https://github.com/torvalds/linux/commit/053c8e1f2).
 ///
 /// # Minimum kernel version
 ///
@@ -1334,11 +1335,17 @@ impl_from_pin!(
 
 macro_rules! impl_from_prog_info {
     (
-        $(#[$doc:meta])*
+        @docs
+            [$($doc:meta)*]
+        @safety_docs
+            [$($safety_doc:meta)*]
         @safety
             [$($safety:tt)?]
         @rest
-            $struct_name:ident $($var:ident : $var_ty:ty)?
+            $struct_name:ident
+            $($var:ident : $var_ty:ty,)?
+        @extra_fields
+            [$($extra_field:ident : $extra_value:expr),* $(,)?]
     ) => {
         impl $struct_name {
             /// Constructs an instance of a [`Self`] from a [`ProgramInfo`].
@@ -1346,12 +1353,14 @@ macro_rules! impl_from_prog_info {
             /// This allows the caller to get a handle to an already loaded
             /// program from the kernel without having to load it again.
             ///
+            $(#[$doc])*
+            ///
             /// # Errors
             ///
             /// - If the program type reported by the kernel does not match
             ///   [`Self::PROGRAM_TYPE`].
             /// - If the file descriptor of the program cannot be cloned.
-            $(#[$doc])*
+            $(#[$safety_doc])*
             pub $($safety)?
             fn from_program_info(
                 info: ProgramInfo,
@@ -1374,6 +1383,7 @@ macro_rules! impl_from_prog_info {
                         VerifierLogLevel::default(),
                     )?,
                     $($var,)?
+                    $($extra_field: $extra_value,)*
                 })
             }
         }
@@ -1381,30 +1391,45 @@ macro_rules! impl_from_prog_info {
 
     // Handle unsafe cases and pass a safety doc section
     (
-        unsafe $struct_name:ident $($var:ident : $var_ty:ty)? $(, $($rest:tt)*)?
+        $(#[$doc:meta])*
+        unsafe $struct_name:ident
+        $($var:ident : $var_ty:ty)?
+        $(=> { $($extra_field:ident : $extra_value:expr),+ $(,)? })?
+        $(, $($rest:tt)*)?
     ) => {
         impl_from_prog_info! {
-            ///
-            /// # Safety
-            ///
-            /// The runtime type of this program, as used by the kernel, is
-            /// overloaded. We assert the program type matches the runtime type
-            /// but we're unable to perform further checks. Therefore, the caller
-            /// must ensure that the program type is correct or the behavior is
-            /// undefined.
+            @docs [$($doc)*]
+            @safety_docs [
+                doc = ""
+                doc = "# Safety"
+                doc = ""
+                doc = "The runtime type of this program, as used by the kernel, is"
+                doc = "overloaded. We assert the program type matches the runtime type"
+                doc = "but we're unable to perform further checks. Therefore, the caller"
+                doc = "must ensure that the program type is correct or the behavior is"
+                doc = "undefined."
+            ]
             @safety [unsafe]
-            @rest $struct_name $($var : $var_ty)?
+            @rest $struct_name $($var : $var_ty,)?
+            @extra_fields [$($($extra_field : $extra_value),+)?]
         }
         $( impl_from_prog_info!($($rest)*); )?
     };
 
     // Handle non-unsafe cases and omit safety doc section
     (
-        $struct_name:ident $($var:ident : $var_ty:ty)? $(, $($rest:tt)*)?
+        $(#[$doc:meta])*
+        $struct_name:ident
+        $($var:ident : $var_ty:ty)?
+        $(=> { $($extra_field:ident : $extra_value:expr),+ $(,)? })?
+        $(, $($rest:tt)*)?
     ) => {
         impl_from_prog_info! {
+            @docs [$($doc)*]
+            @safety_docs []
             @safety []
-            @rest $struct_name $($var : $var_ty)?
+            @rest $struct_name $($var : $var_ty,)?
+            @extra_fields [$($($extra_field : $extra_value),+)?]
         }
         $( impl_from_prog_info!($($rest)*); )?
     };
@@ -1417,7 +1442,11 @@ macro_rules! impl_from_prog_info {
 
 impl_from_prog_info!(
     unsafe KProbe kind : ProbeKind,
-    unsafe UProbe kind : ProbeKind,
+    /// As with [`Self::from_pin`], this constructor starts in unknown mode
+    /// because it does not know whether the original program came from an
+    /// `uprobe` or `uprobe.multi` section. As a result, [`Self::attach`]
+    /// performs runtime mode selection.
+    unsafe UProbe kind : ProbeKind => { attach_mode: uprobe::AttachMode::Unknown },
     TracePoint,
     SocketFilter,
     ReusePortSocketFilter,
