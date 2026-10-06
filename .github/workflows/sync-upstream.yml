@@ -4,12 +4,16 @@ on:
   push:
     paths:
       - ".github/workflows/sync-upstream.yml"
-      - "scripts/sync-upstream.sh"
-      - "scripts/trim_workspace.py"
-      - "scripts/apply-appopt-patches.py"
+      - "scripts/**"
   schedule:
     - cron: "0 20 * * 0"
   workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: "Upstream branch, tag or commit to validate"
+        required: false
+        default: "main"
+        type: string
 
 permissions:
   contents: write
@@ -30,28 +34,42 @@ jobs:
         run: |
           rustup update stable
           rustup default stable
+          rustup component add rustfmt
           rustc --version
           cargo --version
 
+      - name: Test sync scripts
+        run: python3 -m unittest discover -s scripts/tests -v
+
       - name: Sync upstream
+        env:
+          AYA_UPSTREAM_REF: ${{ inputs.upstream_ref || 'main' }}
         run: bash scripts/sync-upstream.sh
+
+      - name: Format generated patches and verify idempotency
+        run: |
+          cargo fmt --all
+          python3 scripts/apply-appopt-patches.py --check
 
       - name: Check format
         run: cargo fmt --all -- --check
 
       - name: Check workspace
-        run: cargo check --workspace --all-targets
+        run: cargo check --workspace --all-targets --all-features
+
+      - name: Build workspace
+        run: cargo build --workspace --all-features
 
       - name: Check Android targets
         run: |
           rustup target add aarch64-linux-android armv7-linux-androideabi x86_64-linux-android i686-linux-android
-          cargo check --workspace --target aarch64-linux-android
-          cargo check --workspace --target armv7-linux-androideabi
-          cargo check --workspace --target x86_64-linux-android
-          cargo check --workspace --target i686-linux-android
+          cargo check --workspace --all-features --target aarch64-linux-android
+          cargo check --workspace --all-features --target armv7-linux-androideabi
+          cargo check --workspace --all-features --target x86_64-linux-android
+          cargo check --workspace --all-features --target i686-linux-android
 
       - name: Test workspace
-        run: cargo test --workspace --lib
+        run: cargo test --workspace --lib --all-features
 
       - name: Create pull request
         if: ${{ success() }}

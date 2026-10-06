@@ -1,4 +1,5 @@
 /target/
 /.upstream-tmp/
 Cargo.lock
+__pycache__/
 
