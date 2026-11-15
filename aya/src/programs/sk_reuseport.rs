@@ -8,14 +8,20 @@ use std::{
 
 use aya_obj::generated::bpf_prog_type::BPF_PROG_TYPE_SK_REUSEPORT;
 pub use aya_obj::programs::SkReuseportAttachType;
+#[cfg(not(target_os = "android"))]
+use libc::{SO_ATTACH_REUSEPORT_EBPF, SO_DETACH_REUSEPORT_BPF};
 use libc::{SOL_SOCKET, setsockopt};
+
+#[cfg(target_os = "android")]
+const SO_ATTACH_REUSEPORT_EBPF: libc::c_int = 52;
+#[cfg(target_os = "android")]
+const SO_DETACH_REUSEPORT_BPF: libc::c_int = 68;
 use thiserror::Error;
 
 use crate::{
     VerifierLogLevel,
     programs::{
-        ProgramData, ProgramError, ProgramType, SO_ATTACH_REUSEPORT_EBPF, SO_DETACH_REUSEPORT_BPF,
-        links::FdLink, load_program_with_attach_type,
+        ProgramData, ProgramError, ProgramType, links::FdLink, load_program_with_attach_type,
     },
 };
 

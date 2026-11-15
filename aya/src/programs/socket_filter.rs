@@ -9,14 +9,20 @@ use std::{
 use aya_obj::generated::{
     SO_ATTACH_BPF, SO_DETACH_BPF, bpf_prog_type::BPF_PROG_TYPE_SOCKET_FILTER,
 };
+#[cfg(not(target_os = "android"))]
+use libc::{SO_ATTACH_REUSEPORT_EBPF, SO_DETACH_REUSEPORT_BPF};
 use libc::{SOL_SOCKET, setsockopt};
+
+#[cfg(target_os = "android")]
+const SO_ATTACH_REUSEPORT_EBPF: libc::c_int = 52;
+#[cfg(target_os = "android")]
+const SO_DETACH_REUSEPORT_BPF: libc::c_int = 68;
 use thiserror::Error;
 
 use crate::{
     VerifierLogLevel,
     programs::{
-        ProgramData, ProgramError, ProgramType, SO_ATTACH_REUSEPORT_EBPF, SO_DETACH_REUSEPORT_BPF,
-        links::FdLink, load_program_without_attach_type,
+        ProgramData, ProgramError, ProgramType, links::FdLink, load_program_without_attach_type,
     },
 };
 
@@ -74,7 +80,7 @@ pub enum SocketFilterError {
 ///
 /// Regular socket filters are scoped to one socket. `SO_ATTACH_BPF` writes the
 /// socket's `sk->sk_filter` field:
-/// <https://github.com/torvalds/linux/blob/v6.9/net/core/filter.c#L1476-L1478>
+/// <https://github.com/torvalds/linux/blob/a38297e3f/net/core/filter.c#L1476-L1478>
 ///
 /// Attaching a new program replaces the current program in that slot, and
 /// detaching clears the slot regardless of which program installed it. On the
@@ -88,8 +94,8 @@ pub enum SocketFilterError {
 /// # Minimum kernel version
 ///
 /// `BPF_PROG_TYPE_SOCKET_FILTER` and `SO_ATTACH_BPF` are present in Linux 3.19:
-/// <https://github.com/torvalds/linux/blob/v3.19/include/uapi/linux/bpf.h#L118-L120>
-/// <https://github.com/torvalds/linux/blob/v3.19/include/uapi/asm-generic/socket.h#L87-L88>
+/// <https://github.com/torvalds/linux/blob/bfa76d495/include/uapi/linux/bpf.h#L118-L120>
+/// <https://github.com/torvalds/linux/blob/bfa76d495/include/uapi/asm-generic/socket.h#L87-L88>
 ///
 /// # Examples
 ///
@@ -170,7 +176,7 @@ impl SocketFilter {
         // calls `sk_detach_filter(sk)` and does not use a program fd.
         // The generic `SOL_SOCKET` path still requires an int-sized optval
         // before dispatching on the specific sockopt.
-        // https://github.com/torvalds/linux/blob/v6.9/net/core/sock.c#L1409-L1414
+        // https://github.com/torvalds/linux/blob/a38297e3f/net/core/sock.c#L1409-L1414
         let dummy: libc::c_int = 0;
 
         setsockopt_socket_filter!(
@@ -214,7 +220,7 @@ impl SocketFilter {
 /// separate kernel-managed slots. Regular filters are scoped to one socket;
 /// reuseport selectors are scoped to the whole `SO_REUSEPORT` group.
 /// `SO_ATTACH_REUSEPORT_EBPF` writes the group's `reuse->prog` field:
-/// <https://github.com/torvalds/linux/blob/v6.9/net/core/sock_reuseport.c#L706-L708>
+/// <https://github.com/torvalds/linux/blob/a38297e3f/net/core/sock_reuseport.c#L706-L708>
 ///
 /// Attaching or detaching one type does not affect the other. For reuseport
 /// groups, attaching through any socket in the group replaces the program used
@@ -237,11 +243,11 @@ impl SocketFilter {
 /// `SO_ATTACH_REUSEPORT_EBPF` can attach socket filter programs to UDP
 /// `SO_REUSEPORT` groups starting in Linux 4.5 and TCP groups starting in
 /// Linux 4.6:
-/// <https://github.com/torvalds/linux/blob/v4.5/net/ipv4/udp.c#L521-L522>
-/// <https://github.com/torvalds/linux/blob/v4.6/net/ipv4/inet_hashtables.c#L237-L239>
+/// <https://github.com/torvalds/linux/blob/b562e44f5/net/ipv4/udp.c#L521-L522>
+/// <https://github.com/torvalds/linux/blob/2dcd0af56/net/ipv4/inet_hashtables.c#L237-L239>
 ///
 /// `SO_DETACH_REUSEPORT_BPF` is handled starting in Linux 5.3:
-/// <https://github.com/torvalds/linux/blob/v5.3/net/core/sock.c#L1042-L1044>
+/// <https://github.com/torvalds/linux/blob/4d856f72c/net/core/sock.c#L1042-L1044>
 ///
 /// # Examples
 ///
@@ -349,7 +355,7 @@ impl ReusePortSocketFilter {
         // `SO_DETACH_REUSEPORT_BPF` identifies the target group from the
         // socket. The generic `SOL_SOCKET` path still requires an int-sized
         // optval before dispatching on the specific sockopt.
-        // https://github.com/torvalds/linux/blob/v6.9/net/core/sock.c#L1409-L1414
+        // https://github.com/torvalds/linux/blob/a38297e3f/net/core/sock.c#L1409-L1414
         let dummy: libc::c_int = 0;
 
         setsockopt_socket_filter!(
